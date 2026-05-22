@@ -1,0 +1,280 @@
+# Importamos las herramientas que necesitamos para que funcione el programa
+
+from machine import Pin, I2C, PWM  # Control de pines, bus de datos para sensores y señal para el zumbador
+import network # Para conectar el ESP32 a la red WiFi
+import dht # Biblioteca para leer el sensor de temperatura y humedad DHT11
+import time # Para controlar tiempos, esperas y pausas
+import math # Para hacer cálculos matemáticos como (raiz)
+import urequests # Para enviar peticiones por internet (a Telegram)
+import socket # Para crear el servidor web y mostrar los datos en el navegador
+import gc #Para limpiar la memoria del ESP32 y evitar que se trabe
+
+# Datos de tu red WiFi
+SSID = "HLM10769 6248" # Nombre de tu red inalámbrica
+PASSWORD = "D3v764&9"  # Contraseña de tu red
+
+wifi = network.WLAN(network.STA_IF) # Creamos el objeto para manejar el WiFi en modo "conectarse a red"
+wifi.active(True)# Encendemos el módulo WiFi
+
+def conectar_wifi():# Creamos una función para conectar, así podemos llamarla cuando queramos
+    if wifi.isconnected():# Si ya está conectado
+        return True                 
+
+    print("Conectando WiFi...") # Mostramos mensaje en consola
+    wifi.connect(SSID, PASSWORD) # Iniciamos la conexión con los datos dados
+
+    timeout = 15 # Definimos un tiempo máximo de espera: 15 segundos
+    while not wifi.isconnected() and timeout > 0:  # Mientras no conecte y quede tiempo...
+        print(".") # Mostramos un punto para saber que sigue intentando
+        time.sleep(1) # Esperamos 1 segundo
+        timeout -= 1 # Restamos 1 segundo al tiempo de espera
+
+    if wifi.isconnected(): # Si al final se conectó
+        print("WiFi OK") # Confirmamos en consola
+        print("IP:", wifi.ifconfig()[0])  # Mostramos la dirección IP para acceder a la página web
+        return True                 
+    else: # Si no conectó en 15 segundos...
+        print("ERROR WiFi") # Mostramos el fallo de que no conecto 
+        return False       
+
+conectar_wifi()  # Ejecutamos la función de conexión nada más iniciar el programa
+
+
+# Datos de tu bot de Telegram
+
+TOKEN = "8473116368:AAFFg3ztgA_kG0-pD6OSQOZR3_rnFbKkzfY"  # Código único de tu bot
+CHAT_ID = "8929308695" # Tu ID del chat para que el bot escriba solo a ese chat 
+URL = "https://api.telegram.org/bot" + TOKEN # Dirección web para comunicarnos con el bot
+
+def enviar_telegram(msg):# Función para mandar mensajes
+    if not wifi.isconnected():# Si no hay internet
+        return# no hacemos nada
+
+    try:# Intentamos hacer el envío
+        gc.collect()# Limpiamos memoria antes de enviar para evitar errores
+        r = urequests.post(URL + "/sendMessage", json={  # Enviamos la petición
+            "chat_id": CHAT_ID, # A quién enviar el mensaje
+            "text": msg # Qué texto queremos que diga
+        })
+        r.close() # Cerramos la conexión para no ocupar memoria
+    except:# Si algo sale mal
+        pass#ignoramos el error y seguimos
+    sensor_dht = dht.DHT11(Pin(15))# Conectamos el sensor DHT11 al pin número 15 del ESP32
+
+# Configuramos el protocolo I2C, que sirve para comunicarse con el sensor de movimiento MPU6050
+i2c = I2C(0, scl=Pin(18), sda=Pin(19), freq=100000)
+MPU = 0x68  # Dirección única del sensor MPU6050 en el bus de datos
+
+def leer(reg): # Función para leer valores del sensor de movimiento
+    h = i2c.readfrom_mem(MPU, reg, 1)[0] # Leemos la parte alta del número
+    l = i2c.readfrom_mem(MPU, reg+1, 1)[0] # Leemos la parte baja del número
+    v = (h << 8) | l # Unimos ambas partes para formar el valor completo
+    if v > 32768: # Si el valor es negativo
+        v -= 65536 # lo convertimos al formato positivo
+    return v                               
+
+buzzer = PWM(Pin(26)) # Conectamos el zumbador al pin 26, usando señal PWM para controlar el sonido
+buzzer.duty(0) # Iniciamos con volumen en 0, es decir, apagado
+boton_panico = Pin(14, Pin.IN, Pin.PULL_UP) # Definimos el pin 14 como entrada para el botón PANICO
+panico = False # Variable que nos dice si se activó la alarma
+
+def panic(pin): # Función que se ejecuta cuando presionamos el botón
+    global panico # Usamos la variable de arriba en esta función
+    panico = True # Marcamos que se activó la emergencia
+
+boton_panico.irq(trigger=Pin.IRQ_FALLING, handler=panic) 
+#  Esta línea hace que el programa detecte al instante cuando presionas el botón, sin tener que estar revisando todo el tiempo
+TEMP_ALTA = 24  # Si la temperatura pasa de 24°C → ALTA
+TEMP_BAJA = 18  # Si baja de 18°C → BAJA
+
+HUM_ALTA = 60 # Si la humedad pasa del 60% → ALTA
+HUM_BAJA = 40 # Si baja del 40% → BAJA
+
+MOVIMIENTO = 1.1 # Valor mínimo para detectar que hay movimiento
+MOV_BRUSCO = 1.6 # Valor para detectar un movimiento fuerte o peligroso
+def buzzer_off():# Función para apagar el zumbador
+    buzzer.duty(0)
+
+def alarma(tipo): # Función que reproduce un sonido distinto según la situación
+    if tipo == "PANICO":# Sonido para emergencia
+        for _ in range(5):
+            buzzer.freq(2500) # Tono agudo
+            buzzer.duty(700)  # Volumen alto
+            time.sleep(0.15)
+            buzzer_off()
+            time.sleep(0.15)
+
+    elif tipo == "MOV_BRUSCO":# Sonido para movimiento fuerte
+        buzzer.freq(1800)
+        buzzer.duty(600)
+        time.sleep(0.4)
+        buzzer_off()
+
+    elif tipo == "TEMP_ALTA":# Sonido para temperatura alta
+        buzzer.freq(1200)
+        buzzer.duty(500)
+        time.sleep(0.6)
+        buzzer_off()
+
+    elif tipo == "TEMP_BAJA":# Sonido para temperatura baja
+        buzzer.freq(800)
+        buzzer.duty(500)
+        time.sleep(0.6)
+        buzzer_off()
+
+    elif tipo == "HUM_ALTA": # Sonido para humedad alta
+        buzzer.freq(1400)
+        buzzer.duty(500)
+        time.sleep(0.6)
+        buzzer_off()
+
+    elif tipo == "HUM_BAJA":# Sonido para humedad baja
+        buzzer.freq(900)
+        buzzer.duty(500)
+        time.sleep(0.6)
+        buzzer_off()
+        def pagina(temp, hum, mov, estado, alerta):
+    # Esta función crea la página web que verás en el navegador
+    return f"""
+    <html>
+    <head>
+        <meta http-equiv="refresh" content="2"> <!-- Se actualiza automáticamente cada 2 segundos -->
+        <title>Monitor Biomedico</title>
+        <style>  <!-- Diseño y colores de la página -->
+            body {{
+                font-family: Arial;
+                background: #0f172a;
+                color: white;
+                text-align: center;
+            }}
+            .card {{
+                background: #1e293b;
+                padding: 15px;
+                margin: 10px;
+                display: inline-block;
+                border-radius: 10px;
+                width: 180px;
+            }}
+            .alerta {{
+                color: red;
+                font-size: 22px;
+                font-weight: bold;
+            }}
+        </style>
+    </head>
+    <body>
+        <h1> MONITOR BIOMÉDICO</h1>
+
+        <!-- Mostramos todos los valores medidos -->
+        <div class="card">Temp <h2>{temp}</h2></div>
+        <div class="card"> Hum <h2>{hum}</h2></div>
+        <div class="card"> Mov <h2>{mov:.2f}</h2></div>
+
+        <div class="card">Estado <h3>{estado}</h3></div>
+        <div class="card alerta">{alerta}</div>
+    </body>
+    </html>
+    """
+server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)  # Creamos el servidor web
+server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1) # Permite reutilizar la IP si se reinicia
+server.settimeout(2) # Tiempo máximo de espera de conexión
+server.bind(("", 80))# Lo conectamos al puerto 80 (estándar web)
+server.listen(5) # Permite hasta 5 conexiones al mismo tiempo
+
+print("Servidor listo") # Aviso de que ya se puede entrar a la página
+ultimo_alerta = "" # Guardamos la última alerta para no enviarla varias veces seguidas
+
+while True:  # Bucle infinito
+    if not wifi.isconnected(): # Si se fue el internet
+        conectar_wifi() #intentamos reconectar
+        continue             
+
+    try:
+        conn, addr = server.accept()  # Esperamos a que alguien abra la página web
+    except:
+        continue  # Si nadie entra, seguimos con las mediciones
+
+    # LEER SENSOR DE TEMPERATURA Y HUMEDAD
+    try:
+        sensor_dht.measure() # Tomamos la medición
+        temp = sensor_dht.temperature() # Guardamos temperatura
+        hum = sensor_dht.humidity() # Guardamos humedad
+    except:
+        temp = 0  # Si hay error, mostramos 0
+        hum = 0
+
+    #  LEER SENSOR DE MOVIMIENTO
+    try:
+        ax = leer(0x3B)/16384  # Leemos movimiento en eje X y ajustamos la escala
+        ay = leer(0x3D)/16384  # Leemos movimiento en eje Y
+        az = leer(0x3F)/16384  # Leemos movimiento en eje Z
+        mov = math.sqrt(ax*ax + ay*ay + az*az) # Calculamos la intensidad total del movimiento
+    except:
+        mov = 0  # Si hay error, mostramos 0
+
+    alerta = "NORMAL"  # Estado inicial
+    estado = "REPOSO"
+
+    # VERIFICAR SI SE ACTIVÓ EL BOTÓN DE PÁNICO
+    if panico:
+        alerta = "PÁNICO"
+        estado = "EMERGENCIA"
+        enviar_telegram(" BOTÓN PÁNICO ACTIVADO")
+        alarma("PANICO") #sonido buzzer 
+        panico = False
+        ultimo_alerta = "PANICO"
+
+    # VERIFICAR MOVIMIENTO
+    elif mov > MOV_BRUSCO: #movimiento mayor a 1.6
+        estado = "MOV BRUSCO" #movimiento brusco 
+        alerta = "PELIGRO"
+        if ultimo_alerta != "MOV":
+            enviar_telegram("MOVIMIENTO BRUSCO")
+            alarma("MOV_BRUSCO") #suena buzzer 
+            ultimo_alerta = "MOV"
+
+    elif mov > MOVIMIENTO: #movimiento mayor a 1.1
+        estado = "MOVIMIENTO" # existe movimiento pero normal 
+
+    #  VERIFICAR TEMPERATURA
+    if temp > TEMP_ALTA: #temp mayor a 24
+        alerta = "TEMP ALTA" #sonido buzzer 
+        if ultimo_alerta != "TEMP_ALTA":
+            enviar_telegram(f"TEMP ALTA: {temp}°C")
+            alarma("TEMP_ALTA")
+            ultimo_alerta = "TEMP_ALTA"
+
+    elif temp < TEMP_BAJA: # temperatuta es menor a 18
+        alerta = "TEMP BAJA" #sonido buzzer 
+        if ultimo_alerta != "TEMP_BAJA":
+            enviar_telegram(f"TEMP BAJA: {temp}°C")
+            alarma("TEMP_BAJA")
+            ultimo_alerta = "TEMP_BAJA"
+
+    #  VERIFICAR HUMEDAD
+    if hum > HUM_ALTA: #humedad mayor a 60
+        alerta = "HUMEDAD ALTA" # detecta el estado 
+        if ultimo_alerta != "HUM_ALTA":
+            enviar_telegram(f"HUMEDAD ALTA: {hum}%")
+            alarma("HUM_ALTA") #sonido buzzer 
+            ultimo_alerta = "HUM_ALTA"
+
+    elif hum < HUM_BAJA: #humedad menor a 40 
+        alerta = "HUMEDAD BAJA"
+        if ultimo_alerta != "HUM_BAJA":
+            enviar_telegram(f"HUMEDAD BAJA: {hum}%")
+            alarma("HUM_BAJA") #sonido buzzer 
+            ultimo_alerta = "HUM_BAJA"
+
+    #  ENVIAR DATOS A LA PÁGINA WEB
+    try:
+        html = pagina(temp, hum, mov, estado, alerta) #llama a la gfuncion pag y le envia los datos 
+        conn.send("HTTP/1.1 200 OK\r\n") #le dice al navegador que la conexion fue exitosa 
+        conn.send("Content-Type: text/html\r\n")# indica que lo que vamos a mandar es una pag HTML, para que la muestre como web 
+        conn.send("Connection: close\r\n\r\n")# se cierra la conexion 
+        conn.sendall(html)# envia toda la pag HTML al navegador 
+        conn.close() #cierra conexion con navegador 
+    except: # si aparece un error 
+        pass #ignora 
+
+    time.sleep(1)  # Esperamos 1 segundo antes de volver a medir todo
